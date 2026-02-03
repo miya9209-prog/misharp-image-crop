@@ -3,7 +3,7 @@ import os
 import re
 import zipfile
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import numpy as np
 import requests
@@ -15,17 +15,17 @@ from PIL import Image
 # =========================
 # 기본 설정
 # =========================
-DEFAULT_TIMEOUT = 20
+DEFAULT_TIMEOUT = 25
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/120.0 Safari/537.36"
 }
 
-# IG 규격
-IG_W, IG_H = 1080, 1350  # 4:5
-SQ_W, SQ_H = 1080, 1080  # 1:1
-SF_W, SF_H = 900, 1600   # 9:16 (요청)
+# 출력 규격
+IG_W, IG_H = 1080, 1350  # 인스타 피드 4:5
+SQ_W, SQ_H = 1080, 1080  # 정방형 1:1
+SF_W, SF_H = 900, 1600   # 숏폼 9:16 (요청 규격)
 
 
 # =========================
@@ -48,95 +48,134 @@ def fetch_bytes(url: str) -> bytes:
 
 
 def normalize_url(src: str, base_url: str) -> str:
-    # //cdn... 형태 처리
     if src.startswith("//"):
         return "https:" + src
-    # 절대
     if src.startswith("http://") or src.startswith("https://"):
         return src
-    # 상대
     if src.startswith("/"):
-        # base domain
         m = re.match(r"^(https?://[^/]+)", base_url)
         if m:
             return m.group(1) + src
-    # 기타 상대
     if base_url.endswith("/"):
         return base_url + src
     return base_url.rsplit("/", 1)[0] + "/" + src
 
 
-def is_probably_detail_image(url: str) -> bool:
-    """
-    URL 문자열 기반 1차 필터:
-    - icon, logo, common 등 제외
-    - product/detail류 우선
-    """
-    u = url.lower()
-    bad = ["icon", "logo", "common", "btn", "banner", "sprite", "loading", "blank", "youtube", "kakao", "naver"]
-    if any(x in u for x in bad):
-        return False
-    # 상세/상품 이미지일 가능성 키워드
-    good = ["product", "upload", "data", "image", "img", "detail", "editor", "contents"]
-    return any(x in u for x in good)
-
-
-def score_detail_candidate(img: Image.Image) -> int:
-    """
-    본문 상세(세로 긴)일수록 점수↑
-    """
-    w, h = img.size
-    score = 0
-    if w >= 600:
-        score += 2
-    if h >= 1200:
-        score += 3
-    if h >= w * 2:
-        score += 3
-    if h >= w * 3:
-        score += 2
-    return score
-
-
 # =========================
-# URL → 본문 상세이미지(세로 JPG) 찾기
+# URL → 본문 상세이미지 URL 수집(강화버전)
 # =========================
 def extract_detail_image_urls_from_product_page(product_url: str) -> List[str]:
+    """
+    ✅ 핵심 개선
+    - 가능한 한 '본문 상세영역' 컨테이너 내부의 img만 수집
+    - lazy-load 속성(ec-data-src / data-src / data-original 등) 지원
+    - 상세가 iframe으로 분리된 경우 iframe src 따라가서 img 수집
+    - 인스타/로고/아이콘/공용 이미지 1차 제거
+    """
     html = requests.get(product_url, headers=UA, timeout=DEFAULT_TIMEOUT).text
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) 모든 img 후보 수집
-    candidates = []
-    for img in soup.find_all("img"):
-        src = img.get("data-src") or img.get("data-original") or img.get("src")
-        if not src:
-            continue
-        src = src.strip()
-        full = normalize_url(src, product_url)
+    detail_selectors = [
+        "#prdDetail",
+        "#prdDetailContent",
+        "#prdDetailCont",
+        "#detailArea",
+        "#productDetail",
+        "#product_detail",
+        "#contents",
+        ".xans-product-detail",
+        ".xans-product-detaildesign",
+        ".detailArea",
+        ".cont",
+        "#tabProductDetail",
+        "#prdDetailContentLazy",
+    ]
 
-        if is_probably_detail_image(full):
-            candidates.append(full)
+    def collect_imgs_from(node, base_for_norm: str) -> List[str]:
+        urls = []
+        for img in node.find_all("img"):
+            src = (
+                img.get("ec-data-src")
+                or img.get("data-src")
+                or img.get("data-original")
+                or img.get("data-lazy")
+                or img.get("src")
+            )
+            if not src:
+                continue
+            full = normalize_url(src.strip(), base_for_norm)
+            urls.append(full)
+        return urls
 
-    # 2) 중복 제거
-    uniq = []
+    candidates: List[str] = []
+
+    # 1) 상세 컨테이너 우선
+    detail_node = None
+    for sel in detail_selectors:
+        found = soup.select_one(sel)
+        if found:
+            detail_node = found
+            break
+
+    if detail_node is not None:
+        candidates.extend(collect_imgs_from(detail_node, product_url))
+    else:
+        # 2) iframe 상세 시도
+        iframe = soup.find("iframe")
+        iframe_src = None
+        if iframe:
+            iframe_src = iframe.get("src") or iframe.get("data-src")
+
+        if iframe_src:
+            try:
+                iframe_url = normalize_url(iframe_src, product_url)
+                html2 = requests.get(iframe_url, headers=UA, timeout=DEFAULT_TIMEOUT).text
+                soup2 = BeautifulSoup(html2, "html.parser")
+
+                detail_node2 = None
+                for sel in detail_selectors:
+                    f2 = soup2.select_one(sel)
+                    if f2:
+                        detail_node2 = f2
+                        break
+
+                if detail_node2 is not None:
+                    candidates.extend(collect_imgs_from(detail_node2, iframe_url))
+                else:
+                    candidates.extend(collect_imgs_from(soup2, iframe_url))
+            except Exception:
+                candidates.extend(collect_imgs_from(soup, product_url))
+        else:
+            # 3) 최후: 전체 문서
+            candidates.extend(collect_imgs_from(soup, product_url))
+
+    # 4) 중복 제거 + 강한 제외 키워드
+    filtered = []
     seen = set()
     for u in candidates:
-        if u not in seen:
-            uniq.append(u)
-            seen.add(u)
+        if u in seen:
+            continue
+        seen.add(u)
 
-    return uniq
+        low = u.lower()
+        bad = ["instagram", "facebook", "kakao", "naver", "logo", "icon", "btn", "sprite", "share", "common"]
+        if any(x in low for x in bad):
+            continue
+
+        filtered.append(u)
+
+    return filtered
 
 
-def pick_body_detail_images(product_url: str, max_fetch: int = 12) -> List[Tuple[str, Image.Image]]:
+def pick_body_detail_images(product_url: str, max_fetch: int = 120) -> List[Tuple[str, Image.Image]]:
     """
-    상품 URL에서 '본문 상세페이지 이미지'만 최대한 골라오기
-    - 여러 장이면: '세로로 긴 이미지' 위주로 선별
-    - 썸네일/아이콘 제외 목적
+    ✅ 본문 상세이미지를 가능한 한 모두 가져오기
+    - 실제 이미지 크기 기반으로 로고/아이콘 제거
     """
     urls = extract_detail_image_urls_from_product_page(product_url)
+    if not urls:
+        return []
 
-    # 너무 많으면 앞에서 조금만 fetch
     urls = urls[:max_fetch]
 
     images: List[Tuple[str, Image.Image]] = []
@@ -144,28 +183,19 @@ def pick_body_detail_images(product_url: str, max_fetch: int = 12) -> List[Tuple
         try:
             b = fetch_bytes(u)
             im = pil_open_rgb(b)
+            w, h = im.size
+
+            # ✅ 아이콘/로고 제거 필터
+            if w < 650 and h < 650:
+                continue
+            if (abs(w - h) <= 20) and (w < 800) and (h < 800):
+                continue
+
             images.append((u, im))
         except Exception:
             continue
 
-    if not images:
-        return []
-
-    # "본문 상세"는 보통 세로 긴 이미지를 포함
-    scored = sorted(images, key=lambda x: score_detail_candidate(x[1]), reverse=True)
-
-    # 점수 상위만 추리되, 너무 공격적이면 놓칠 수 있으니 최소 1장~최대 4장
-    # (상세가 여러 장인 경우 대비)
-    top = []
-    for u, im in scored:
-        if score_detail_candidate(im) >= 5:
-            top.append((u, im))
-
-    if not top:
-        top = [scored[0]]
-
-    # 상위 4장 제한 (너무 많으면 품질 떨어짐)
-    return top[:4]
+    return images
 
 
 # =========================
@@ -173,17 +203,13 @@ def pick_body_detail_images(product_url: str, max_fetch: int = 12) -> List[Tuple
 # =========================
 @dataclass
 class SplitConfig:
-    white_thr: int = 245        # 픽셀 흰색 판정 기준
-    row_white_ratio: float = 0.985  # 한 줄이 흰색으로 간주될 비율
-    min_gap: int = 25           # 컷 사이 여백 최소 길이(px)
-    edge_pad: int = 0           # 분리 후 여백 조금 남길지(기본 0)
+    white_thr: int = 245
+    row_white_ratio: float = 0.985
+    min_gap: int = 25
+    edge_pad: int = 0
 
 
 def _find_white_runs(gray: np.ndarray, cfg: SplitConfig) -> List[Tuple[int, int]]:
-    """
-    gray: HxW
-    return: 흰줄(여백) 구간들의 (start_row, end_row) 리스트
-    """
     white_mask = (gray >= cfg.white_thr)
     ratios = white_mask.mean(axis=1)
     is_white_row = ratios >= cfg.row_white_ratio
@@ -208,35 +234,27 @@ def _find_white_runs(gray: np.ndarray, cfg: SplitConfig) -> List[Tuple[int, int]
 
 
 def split_by_white_gaps(img: Image.Image, cfg: SplitConfig) -> List[Image.Image]:
-    """
-    세로로 긴 상세페이지 이미지에서
-    '가로 전체가 흰색에 가까운 여백 구간'을 기준으로 컷을 분리.
-    """
     arr = np.array(img.convert("RGB"))
     gray = arr.mean(axis=2).astype(np.uint8)
     H, W = gray.shape
 
     runs = _find_white_runs(gray, cfg)
-
-    # 여백이 거의 없으면 "통 이미지 1장" 처리
     if len(runs) == 0:
         return [img]
 
-    # runs를 경계로 구간 생성
     segments = []
     prev_end = 0
 
     for (s, e) in runs:
         seg_top = prev_end
         seg_bottom = s - 1
-        if seg_bottom - seg_top + 1 > 30:  # 너무 얇은 건 제외
+        if seg_bottom - seg_top + 1 > 30:
             crop_top = max(0, seg_top + cfg.edge_pad)
             crop_bottom = min(H - 1, seg_bottom - cfg.edge_pad)
             seg = img.crop((0, crop_top, W, crop_bottom + 1))
             segments.append(seg)
         prev_end = e + 1
 
-    # 마지막 구간
     if H - prev_end > 30:
         crop_top = max(0, prev_end + cfg.edge_pad)
         seg = img.crop((0, crop_top, W, H))
@@ -246,37 +264,29 @@ def split_by_white_gaps(img: Image.Image, cfg: SplitConfig) -> List[Image.Image]
 
 
 def trim_white_margins(img: Image.Image, white_thr: int = 245, ratio_thr: float = 0.98) -> Image.Image:
-    """
-    컷 단위 이미지에서 상하좌우 흰 여백을 최대한 제거.
-    (피사체가 흰 배경일 때 과하게 잘릴 수 있으니 ratio_thr로 안전장치)
-    """
     arr = np.array(img.convert("RGB"))
     gray = arr.mean(axis=2)
 
     H, W = gray.shape
-
-    # 행/열별 "흰색 비율"
     row_ratio = (gray >= white_thr).mean(axis=1)
     col_ratio = (gray >= white_thr).mean(axis=0)
 
-    # top
     top = 0
     while top < H and row_ratio[top] >= ratio_thr:
         top += 1
-    # bottom
+
     bottom = H - 1
     while bottom >= 0 and row_ratio[bottom] >= ratio_thr:
         bottom -= 1
-    # left
+
     left = 0
     while left < W and col_ratio[left] >= ratio_thr:
         left += 1
-    # right
+
     right = W - 1
     while right >= 0 and col_ratio[right] >= ratio_thr:
         right -= 1
 
-    # 방어: 너무 작아지면 원본 반환
     if bottom - top < 50 or right - left < 50:
         return img
 
@@ -284,12 +294,9 @@ def trim_white_margins(img: Image.Image, white_thr: int = 245, ratio_thr: float 
 
 
 # =========================
-# 크롭 모드 (비율/규격)
+# 크롭 모드
 # =========================
 def center_crop_to_ratio(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """
-    왜곡 없이 중앙 기준으로 비율 맞추기(필요한 만큼만 좌/우 또는 상/하 잘라냄)
-    """
     w, h = img.size
     target_ratio = target_w / target_h
     src_ratio = w / h
@@ -298,25 +305,16 @@ def center_crop_to_ratio(img: Image.Image, target_w: int, target_h: int) -> Imag
         return img
 
     if src_ratio > target_ratio:
-        # 너무 넓다 -> 좌우 자르기
         new_w = int(round(h * target_ratio))
         left = (w - new_w) // 2
         return img.crop((left, 0, left + new_w, h))
     else:
-        # 너무 높다 -> 상하 자르기
         new_h = int(round(w / target_ratio))
         top = (h - new_h) // 2
         return img.crop((0, top, w, top + new_h))
 
 
 def crop_mode_apply(img: Image.Image, mode: str) -> Image.Image:
-    """
-    mode:
-      - "이미지 그대로 자르기" => trim만 수행(리사이즈/추가 크롭 없음)
-      - "인스타그램 피드 규격(4:5)"
-      - "정방형(1:1)"
-      - "숏폼규격(900x1600)"
-    """
     if mode == "이미지 그대로 자르기":
         return img
 
@@ -336,7 +334,7 @@ def crop_mode_apply(img: Image.Image, mode: str) -> Image.Image:
 
 
 # =========================
-# 출력(저장/ZIP)
+# 저장/ZIP
 # =========================
 def img_to_jpg_bytes(img: Image.Image, quality: int = 95) -> bytes:
     buf = io.BytesIO()
@@ -352,14 +350,37 @@ def build_zip(files: List[Tuple[str, bytes]]) -> bytes:
     return zbuf.getvalue()
 
 
+def extract_images_from_zip(zip_bytes: bytes) -> List[Tuple[str, Image.Image]]:
+    """
+    ZIP 내부 이미지들을 파일명 순서로 읽어서 반환
+    """
+    out = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+        names = [n for n in zf.namelist() if not n.endswith("/")]
+
+        # 파일명 정렬(실무에서 순서 유지에 유리)
+        names.sort()
+
+        for n in names:
+            low = n.lower()
+            if not (low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".png") or low.endswith(".webp")):
+                continue
+            try:
+                b = zf.read(n)
+                im = pil_open_rgb(b)
+                out.append((os.path.basename(n), im))
+            except Exception:
+                continue
+    return out
+
+
 # =========================
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="misharp-image-extractor", layout="wide")
 st.title("상세페이지 이미지 추출기")
-st.caption("미샵 상품 URL 또는 상세페이지 JPG를 넣으면, 본문 상품컷을 흰 여백 없이 분리/트리밍 후 규격별로 저장합니다.")
+st.caption("미샵 상품 URL 또는 상세페이지 이미지를 넣으면, 본문 상품컷을 흰 여백 없이 분리/트리밍 후 규격별로 저장합니다.")
 
-# ---- Sidebar: 옵션 ----
 with st.sidebar:
     st.header("설정")
 
@@ -385,24 +406,24 @@ with st.sidebar:
     cfg = SplitConfig(white_thr=white_thr, row_white_ratio=row_ratio, min_gap=min_gap, edge_pad=0)
 
     st.divider()
-    st.caption("※ ‘이미지 그대로’는 **리사이즈/크롭 없이** 분리+트리밍만 합니다.")
+    st.caption("※ ‘이미지 그대로’는 **리사이즈/크롭 없이** 분리 + 트리밍만 합니다.")
 
 
-tab1, tab2 = st.tabs(["URL 입력", "JPG 업로드"])
+tab1, tab2 = st.tabs(["URL 입력", "이미지/ZIP 업로드"])
 
 
 # -------------------------
-# 1) URL 입력
+# URL 입력 탭
 # -------------------------
 with tab1:
     st.subheader("미샵 상품 URL 입력")
-    url = st.text_input("상품 URL", placeholder="https://miyawa.cafe24.com/product/detail.html?product_no=xxxx")
+    url = st.text_input("상품 URL", placeholder="https://misharp.co.kr/product/detail.html?product_no=xxxxx")
 
     colA, colB = st.columns([1, 1])
     with colA:
         do_run = st.button("본문 상품컷 추출하기", type="primary", use_container_width=True)
     with colB:
-        st.info("URL 입력 시: **상품 상세 HTML에서 본문 상세이미지 후보만 선별**합니다.", icon="ℹ️")
+        st.info("URL 입력 시: 상품 상세 HTML에서 **본문 상세이미지 후보만 선별**합니다.", icon="ℹ️")
 
     if do_run:
         if not url.strip():
@@ -410,49 +431,50 @@ with tab1:
         else:
             with st.spinner("상품 페이지 분석 → 본문 상세이미지 다운로드 중..."):
                 try:
-                    detail_imgs = pick_body_detail_images(url.strip(), max_fetch=12)
+                    detail_imgs = pick_body_detail_images(url.strip(), max_fetch=120)
                 except Exception as e:
                     detail_imgs = []
                     st.error(f"URL 처리 중 오류: {e}")
 
             if not detail_imgs:
-                st.error("본문 상세이미지를 찾지 못했습니다. (URL이 올바른지 / 접근이 가능한지 확인)")
+                st.error("본문 상세이미지를 찾지 못했습니다. (URL이 올바른지 / 접근 가능한지 확인)")
             else:
-                st.success(f"본문 상세이미지 후보 {len(detail_imgs)}장 찾음 (세로 상세 위주)")
-                # 각 상세이미지에서 컷 분리
+                st.success(f"본문 상세이미지 후보 {len(detail_imgs)}장 찾음")
+
                 all_cuts: List[Image.Image] = []
+
+                # ✅ 이미지가 여러 장일 수 있으므로: 긴 합본만 분리, 단독컷은 그대로
                 for idx, (img_url, im) in enumerate(detail_imgs, start=1):
-                    segs = split_by_white_gaps(im, cfg)
-                    for s in segs:
-                        cut = trim_white_margins(s, white_thr=white_thr, ratio_thr=trim_ratio)
+                    w, h = im.size
+                    if h >= 1600 and h >= w * 1.8:
+                        segs = split_by_white_gaps(im, cfg)
+                        for s in segs:
+                            cut = trim_white_margins(s, white_thr=white_thr, ratio_thr=trim_ratio)
+                            all_cuts.append(cut)
+                    else:
+                        cut = trim_white_margins(im, white_thr=white_thr, ratio_thr=trim_ratio)
                         all_cuts.append(cut)
 
                 if not all_cuts:
                     st.error("컷 분리에 실패했습니다. (여백 판정 값을 조정해보세요)")
                 else:
-                    # 모드 적용
                     processed = [crop_mode_apply(c, crop_mode) for c in all_cuts]
 
-                    # 파일명
                     base = safe_base(url.strip())
                     jpg_files: List[Tuple[str, bytes]] = []
                     for i, img in enumerate(processed, start=1):
                         fn = f"{base}_cut_{i:03d}.jpg"
                         jpg_files.append((fn, img_to_jpg_bytes(img, quality=95)))
 
-                    # 미리보기
                     st.divider()
                     st.subheader("결과 미리보기")
                     st.write(f"- 추출된 컷: **{len(processed)}장**")
                     st.caption("미리보기는 일부만 보일 수 있습니다.")
-                    preview = processed[:18]
-                    st.image(preview, width=160)
+                    st.image(processed[:18], width=160)
 
-                    # 다운로드
                     st.divider()
                     st.subheader("다운로드")
 
-                    # 1장 JPG(첫 컷)
                     st.download_button(
                         "첫 번째 컷 JPG 다운로드",
                         data=jpg_files[0][1],
@@ -462,7 +484,6 @@ with tab1:
                         key=f"dl_first_url_{base}_{crop_mode}",
                     )
 
-                    # ZIP
                     zip_bytes = build_zip(jpg_files)
                     st.download_button(
                         "전체 컷 ZIP 다운로드",
@@ -475,61 +496,109 @@ with tab1:
 
 
 # -------------------------
-# 2) JPG 업로드
+# 이미지/ZIP 업로드 탭
 # -------------------------
 with tab2:
-    st.subheader("상세페이지 JPG 업로드")
-    up = st.file_uploader("상세페이지 JPG 파일", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=False)
+    st.subheader("상세페이지 이미지 또는 ZIP 업로드")
 
-    do_run2 = st.button("업로드 이미지에서 상품컷 추출하기", type="primary", use_container_width=True)
+    ups = st.file_uploader(
+        "상세페이지 이미지 업로드 (여러 장 가능)",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True
+    )
+
+    up_zip = st.file_uploader(
+        "ZIP 업로드 (ZIP 안에 이미지가 들어있어야 함)",
+        type=["zip"],
+        accept_multiple_files=False
+    )
+
+    do_run2 = st.button("업로드 파일에서 상품컷 추출하기", type="primary", use_container_width=True)
 
     if do_run2:
-        if not up:
-            st.error("상세페이지 JPG를 업로드해주세요.")
+        if (not ups) and (not up_zip):
+            st.error("이미지(1장 이상) 또는 ZIP 파일을 업로드해주세요.")
         else:
-            try:
-                im = Image.open(up).convert("RGB")
-            except Exception as e:
-                st.error(f"이미지 열기 실패: {e}")
-                im = None
+            all_sources: List[Tuple[str, Image.Image]] = []
 
-            if im:
-                segs = split_by_white_gaps(im, cfg)
-                cuts = [trim_white_margins(s, white_thr=white_thr, ratio_thr=trim_ratio) for s in segs]
-                processed = [crop_mode_apply(c, crop_mode) for c in cuts]
+            # 1) 이미지 여러장
+            if ups:
+                for up in ups:
+                    try:
+                        im = Image.open(up).convert("RGB")
+                        all_sources.append((up.name, im))
+                    except Exception as e:
+                        st.warning(f"{up.name} 이미지 열기 실패: {e}")
 
-                base = safe_base(up.name)
-                jpg_files: List[Tuple[str, bytes]] = []
-                for i, img in enumerate(processed, start=1):
-                    fn = f"{base}_cut_{i:03d}.jpg"
-                    jpg_files.append((fn, img_to_jpg_bytes(img, quality=95)))
+            # 2) ZIP 내부 이미지
+            if up_zip is not None:
+                try:
+                    zbytes = up_zip.read()
+                    zimgs = extract_images_from_zip(zbytes)
+                    # zip 내 파일명과 이미지
+                    all_sources.extend(zimgs)
+                except Exception as e:
+                    st.warning(f"ZIP 처리 실패: {e}")
 
-                st.divider()
-                st.subheader("결과 미리보기")
-                st.write(f"- 추출된 컷: **{len(processed)}장**")
-                st.image(processed[:18], width=160)
+            if not all_sources:
+                st.error("업로드된 파일에서 이미지를 읽지 못했습니다.")
+            else:
+                all_cuts: List[Image.Image] = []
+                base_names: List[str] = [safe_base(n) for n, _ in all_sources]
+                base = base_names[0] if base_names else "detail"
 
-                st.divider()
-                st.subheader("다운로드")
+                for name, im in all_sources:
+                    w, h = im.size
+                    if h >= 1600 and h >= w * 1.8:
+                        segs = split_by_white_gaps(im, cfg)
+                        for s in segs:
+                            cut = trim_white_margins(s, white_thr=white_thr, ratio_thr=trim_ratio)
+                            all_cuts.append(cut)
+                    else:
+                        cut = trim_white_margins(im, white_thr=white_thr, ratio_thr=trim_ratio)
+                        all_cuts.append(cut)
 
-                st.download_button(
-                    "첫 번째 컷 JPG 다운로드",
-                    data=jpg_files[0][1],
-                    file_name=jpg_files[0][0],
-                    mime="image/jpeg",
-                    use_container_width=True,
-                    key=f"dl_first_upload_{base}_{crop_mode}",
-                )
+                if not all_cuts:
+                    st.error("컷 추출에 실패했습니다. (여백 판정 값을 조정해보세요)")
+                else:
+                    processed = [crop_mode_apply(c, crop_mode) for c in all_cuts]
 
-                zip_bytes = build_zip(jpg_files)
-                st.download_button(
-                    "전체 컷 ZIP 다운로드",
-                    data=zip_bytes,
-                    file_name=f"{base}_cuts.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    key=f"dl_zip_upload_{base}_{crop_mode}",
-                )
+                    # 파일이 여러 개면 multi 표기
+                    if len(all_sources) > 1:
+                        base = f"{base}_multi"
+
+                    jpg_files: List[Tuple[str, bytes]] = []
+                    for i, img in enumerate(processed, start=1):
+                        fn = f"{base}_cut_{i:03d}.jpg"
+                        jpg_files.append((fn, img_to_jpg_bytes(img, quality=95)))
+
+                    st.divider()
+                    st.subheader("결과 미리보기")
+                    st.write(f"- 입력 이미지: **{len(all_sources)}개**")
+                    st.write(f"- 추출된 컷: **{len(processed)}장**")
+                    st.image(processed[:18], width=160)
+
+                    st.divider()
+                    st.subheader("다운로드")
+
+                    st.download_button(
+                        "첫 번째 컷 JPG 다운로드",
+                        data=jpg_files[0][1],
+                        file_name=jpg_files[0][0],
+                        mime="image/jpeg",
+                        use_container_width=True,
+                        key=f"dl_first_upload_{base}_{crop_mode}",
+                    )
+
+                    zip_bytes = build_zip(jpg_files)
+                    st.download_button(
+                        "전체 컷 ZIP 다운로드",
+                        data=zip_bytes,
+                        file_name=f"{base}_cuts.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        key=f"dl_zip_upload_{base}_{crop_mode}",
+                    )
 
 
 # =========================
