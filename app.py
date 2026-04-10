@@ -692,6 +692,59 @@ def build_items_from_sources(source_images: List[Image.Image], auto_exclude_text
     return all_items
 
 
+def build_items_from_product_urls_incremental(
+    product_urls: List[str],
+    auto_exclude_text: bool = True,
+    progress_bar=None,
+    progress_text=None,
+) -> Tuple[List[CutItem], List[str]]:
+    """상품 URL들을 한 번에 원본 이미지로 쌓지 않고, 1개씩 처리해서 메모리 사용량을 줄입니다."""
+    all_items: List[CutItem] = []
+    failed_urls: List[str] = []
+    global_idx = 1
+    total = max(1, len(product_urls))
+
+    for i, u in enumerate(product_urls, start=1):
+        if progress_bar is not None:
+            progress_bar.progress(min(i / total, 1.0))
+        if progress_text is not None:
+            progress_text.text(f"상품 처리 중... {i}/{total}")
+
+        try:
+            source_images = fetch_detail_images_from_product_url(u)
+            if not source_images:
+                failed_urls.append(u)
+                continue
+
+            for img in source_images:
+                w, h = img.size
+                extracted = segment_long_detail_image(img) if (h > w * 2 and h > 2000) else split_into_photo_objects(img)
+
+                for cut in extracted:
+                    cut = trim_white_margin_tight(cut, thr=WHITE_THR)
+                    ex = False
+                    reason = ""
+                    if auto_exclude_text:
+                        ex, reason = looks_like_text_card(cut)
+
+                    ww, hh = cut.size
+                    if ww < 300 or hh < 240:
+                        ex = True
+                        reason = reason or "너무 작은 이미지(조각)로 제외"
+
+                    all_items.append(CutItem(idx=global_idx, pil=cut, excluded_auto=ex, reason=reason))
+                    global_idx += 1
+        except Exception:
+            failed_urls.append(u)
+
+    if progress_bar is not None:
+        progress_bar.progress(1.0)
+    if progress_text is not None:
+        progress_text.text(f"상품 처리 완료: {len(product_urls)}개 URL 확인")
+
+    return all_items, failed_urls
+
+
 # -----------------------------
 # UI 스타일
 # -----------------------------
@@ -729,6 +782,7 @@ with colA:
     product_url_text = ""
     category_url = ""
     uploaded_files = None
+    max_target_products = 200
 
     if input_type == "상품 URL":
         product_url_text = st.text_area(
@@ -755,6 +809,16 @@ with colA:
             type=["jpg", "jpeg"],
             accept_multiple_files=True,
             help="긴 상세페이지 이미지 1장 또는 여러 장을 올릴 수 있습니다.",
+        )
+
+    if input_type in ["상품 URL", "카테고리 URL"]:
+        max_target_products = st.number_input(
+            "최대 처리 상품 수",
+            min_value=1,
+            max_value=500,
+            value=200,
+            step=10,
+            help="카테고리 전체가 매우 클 때 앱이 무거워지는 것을 막기 위한 안전장치입니다. 상품 URL 여러 개 입력 시에도 동일하게 적용됩니다.",
         )
 
 with colB:
@@ -786,6 +850,7 @@ if run:
         with st.spinner("이미지 수집/분석 중..."):
             base_name = "misharp_detail"
             source_images: List[Image.Image] = []
+            items: List[CutItem] = []
 
             if input_type == "상품 URL":
                 product_urls = split_input_urls(product_url_text)
@@ -793,20 +858,31 @@ if run:
                     st.error("상품 URL을 1개 이상 입력해 주세요.")
                     st.stop()
 
+                if len(product_urls) > max_target_products:
+                    product_urls = product_urls[:max_target_products]
+
                 if len(product_urls) == 1:
                     base_name = guess_base_name_from_url(product_urls[0])
                 else:
                     base_name = f"multi_{len(product_urls)}products"
 
-                imgs, failed_urls = fetch_detail_images_from_multiple_product_urls(product_urls)
+                progress_bar = st.progress(0.0)
+                progress_text = st.empty()
+                items, failed_urls = build_items_from_product_urls_incremental(
+                    product_urls,
+                    auto_exclude_text=auto_exclude_text,
+                    progress_bar=progress_bar,
+                    progress_text=progress_text,
+                )
+                progress_text.empty()
 
-                if not imgs:
+                if not items:
                     st.error("입력한 상품 URL들에서 본문 상세이미지를 찾지 못했어요. (접근 제한/본문 이미지가 다른 방식일 수 있음)")
                     st.stop()
 
-                source_images = imgs
                 st.session_state["last_failed_urls"] = failed_urls
                 st.session_state["last_input_url_count"] = len(product_urls)
+                st.session_state["last_truncated_by_limit"] = False
 
             elif input_type == "카테고리 URL":
                 category_url = normalize_url(category_url)
@@ -819,16 +895,31 @@ if run:
                     st.error("카테고리에서 상품 URL을 찾지 못했어요.")
                     st.stop()
 
-                base_name = f"category_{len(product_urls)}products"
-                imgs, failed_urls = fetch_detail_images_from_multiple_product_urls(product_urls)
+                original_count = len(product_urls)
+                truncated_by_limit = False
+                if len(product_urls) > max_target_products:
+                    product_urls = product_urls[:max_target_products]
+                    truncated_by_limit = True
 
-                if not imgs:
+                base_name = f"category_{len(product_urls)}products"
+                progress_bar = st.progress(0.0)
+                progress_text = st.empty()
+                items, failed_urls = build_items_from_product_urls_incremental(
+                    product_urls,
+                    auto_exclude_text=auto_exclude_text,
+                    progress_bar=progress_bar,
+                    progress_text=progress_text,
+                )
+                progress_text.empty()
+
+                if not items:
                     st.error("카테고리 상품들에서 본문 상세이미지를 찾지 못했어요. (접근 제한/본문 이미지가 다른 방식일 수 있음)")
                     st.stop()
 
-                source_images = imgs
                 st.session_state["last_failed_urls"] = failed_urls
                 st.session_state["last_input_url_count"] = len(product_urls)
+                st.session_state["last_total_found_product_urls"] = original_count
+                st.session_state["last_truncated_by_limit"] = truncated_by_limit
 
             else:
                 if not uploaded_files or len(uploaded_files) == 0:
@@ -849,7 +940,8 @@ if run:
                     st.error("업로드한 파일을 이미지로 읽지 못했어요.")
                     st.stop()
 
-            items = build_items_from_sources(source_images, auto_exclude_text=auto_exclude_text)
+            if input_type == "상세페이지 JPG 업로드":
+                items = build_items_from_sources(source_images, auto_exclude_text=auto_exclude_text)
 
             if not items:
                 st.error("추출 결과가 없습니다.")
