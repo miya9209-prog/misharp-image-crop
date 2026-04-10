@@ -6,7 +6,7 @@ import re
 import traceback
 import zipfile
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Set
 
 import numpy as np
 import requests
@@ -429,6 +429,110 @@ def normalize_url(url: str) -> str:
 
 
 
+
+
+def split_input_urls(text: str) -> List[str]:
+    if not text:
+        return []
+    parts = re.split(r"[\n\r,;\t ]+", text.strip())
+    return [normalize_url(x) for x in parts if x.strip()]
+
+
+def extract_product_urls_from_html(base_url: str, html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    found: List[str] = []
+
+    for a in soup.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        full = absolutize(base_url, href)
+        low = full.lower()
+        if "/product/detail.html" in low and "product_no=" in low:
+            found.append(full)
+
+    cleaned = []
+    seen: Set[str] = set()
+    for u in found:
+        m = re.search(r"product_no=(\d+)", u)
+        if not m:
+            continue
+        key = m.group(1)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(u)
+    return cleaned
+
+
+def extract_category_pagination_urls(base_url: str, html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    urls: List[str] = []
+    for a in soup.select("a[href]"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        full = absolutize(base_url, href)
+        low = full.lower()
+        if "cate_no=" in low and ("page=" in low or "sort_method" in low or "/product/list.html" in low):
+            urls.append(full)
+    out = []
+    seen = set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def fetch_product_urls_from_category_url(category_url: str, max_pages: int = 30) -> List[str]:
+    category_url = normalize_url(category_url)
+    first_html = fetch_html(category_url)
+
+    page_urls = [category_url]
+    for u in extract_category_pagination_urls(category_url, first_html):
+        if u not in page_urls:
+            page_urls.append(u)
+
+    product_urls: List[str] = []
+    seen_products: Set[str] = set()
+    seen_pages: Set[str] = set()
+
+    for page_url in page_urls[:max_pages]:
+        if page_url in seen_pages:
+            continue
+        seen_pages.add(page_url)
+
+        html = first_html if page_url == category_url else fetch_html(page_url)
+        for u in extract_product_urls_from_html(page_url, html):
+            m = re.search(r"product_no=(\d+)", u)
+            key = m.group(1) if m else u
+            if key in seen_products:
+                continue
+            seen_products.add(key)
+            product_urls.append(u)
+
+        more_pages = extract_category_pagination_urls(page_url, html)
+        for u in more_pages:
+            if u not in page_urls and len(page_urls) < max_pages:
+                page_urls.append(u)
+
+    return product_urls
+
+
+def fetch_detail_images_from_multiple_product_urls(product_urls: List[str]) -> Tuple[List[Image.Image], List[str]]:
+    all_images: List[Image.Image] = []
+    failed_urls: List[str] = []
+    for u in product_urls:
+        try:
+            imgs = fetch_detail_images_from_product_url(u)
+            if imgs:
+                all_images.extend(imgs)
+            else:
+                failed_urls.append(u)
+        except Exception:
+            failed_urls.append(u)
+    return all_images, failed_urls
 def fetch_html(url: str, timeout: int = 15) -> str:
     try:
         r = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
@@ -620,18 +724,29 @@ st.subheader("1) 입력")
 colA, colB = st.columns([1.25, 1])
 
 with colA:
-    input_type = st.radio("입력 선택", ["상품 URL", "상세페이지 JPG 업로드"], horizontal=True)
+    input_type = st.radio("입력 선택", ["상품 URL", "카테고리 URL", "상세페이지 JPG 업로드"], horizontal=True)
 
-    product_url = ""
+    product_url_text = ""
+    category_url = ""
     uploaded_files = None
 
     if input_type == "상품 URL":
-        product_url = st.text_input(
-            "미샵 상품 URL",
-            placeholder="https://misharp.co.kr/product/detail.html?product_no=XXXXX ...",
+        product_url_text = st.text_area(
+            "미샵 상품 URL (여러 개 입력 가능)",
+            placeholder="https://misharp.co.kr/product/detail.html?product_no=11111\nhttps://misharp.co.kr/product/detail.html?product_no=22222",
+            height=140,
         )
         st.markdown(
-            '<div class="small-note">※ URL 입력 시: <b>상품 상세 HTML에서 본문 상세이미지 후보만</b> 선별해 처리합니다.</div>',
+            '<div class="small-note">※ 줄바꿈으로 여러 상품 URL을 한 번에 넣을 수 있습니다. 각 상품 상세 HTML에서 <b>본문 상세이미지 후보만</b> 선별해 처리합니다.</div>',
+            unsafe_allow_html=True,
+        )
+    elif input_type == "카테고리 URL":
+        category_url = st.text_input(
+            "미샵 카테고리 URL",
+            placeholder="https://misharp.co.kr/product/list.html?cate_no=XXX",
+        )
+        st.markdown(
+            '<div class="small-note">※ 카테고리 URL 입력 시: 해당 카테고리 페이지의 상품 URL을 모아 <b>카테고리 내 모든 상품을 순차 처리</b>합니다.</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -673,19 +788,47 @@ if run:
             source_images: List[Image.Image] = []
 
             if input_type == "상품 URL":
-                product_url = normalize_url(product_url)
-                if not product_url:
-                    st.error("상품 URL을 입력해 주세요.")
+                product_urls = split_input_urls(product_url_text)
+                if not product_urls:
+                    st.error("상품 URL을 1개 이상 입력해 주세요.")
                     st.stop()
 
-                base_name = guess_base_name_from_url(product_url)
-                imgs = fetch_detail_images_from_product_url(product_url)
+                if len(product_urls) == 1:
+                    base_name = guess_base_name_from_url(product_urls[0])
+                else:
+                    base_name = f"multi_{len(product_urls)}products"
+
+                imgs, failed_urls = fetch_detail_images_from_multiple_product_urls(product_urls)
 
                 if not imgs:
-                    st.error("본문 상세이미지를 찾지 못했어요. (접근 제한/본문 이미지가 다른 방식일 수 있음)")
+                    st.error("입력한 상품 URL들에서 본문 상세이미지를 찾지 못했어요. (접근 제한/본문 이미지가 다른 방식일 수 있음)")
                     st.stop()
 
                 source_images = imgs
+                st.session_state["last_failed_urls"] = failed_urls
+                st.session_state["last_input_url_count"] = len(product_urls)
+
+            elif input_type == "카테고리 URL":
+                category_url = normalize_url(category_url)
+                if not category_url:
+                    st.error("카테고리 URL을 입력해 주세요.")
+                    st.stop()
+
+                product_urls = fetch_product_urls_from_category_url(category_url)
+                if not product_urls:
+                    st.error("카테고리에서 상품 URL을 찾지 못했어요.")
+                    st.stop()
+
+                base_name = f"category_{len(product_urls)}products"
+                imgs, failed_urls = fetch_detail_images_from_multiple_product_urls(product_urls)
+
+                if not imgs:
+                    st.error("카테고리 상품들에서 본문 상세이미지를 찾지 못했어요. (접근 제한/본문 이미지가 다른 방식일 수 있음)")
+                    st.stop()
+
+                source_images = imgs
+                st.session_state["last_failed_urls"] = failed_urls
+                st.session_state["last_input_url_count"] = len(product_urls)
 
             else:
                 if not uploaded_files or len(uploaded_files) == 0:
@@ -720,6 +863,12 @@ if run:
             st.session_state.pop("dl_zip_name", None)
 
         st.success(f"추출 완료! (총 {len(items)}개 후보) 아래 3)에서 미리보기/제외/다운로드를 진행하세요.")
+        if input_type in ["상품 URL", "카테고리 URL"]:
+            url_count = st.session_state.get("last_input_url_count", 0)
+            failed_urls = st.session_state.get("last_failed_urls", [])
+            st.info(f"처리 대상 상품 URL: {url_count}개 / 이미지 추출 실패 URL: {len(failed_urls)}개")
+            if failed_urls and debug_mode:
+                st.code("\n".join(failed_urls))
 
     except Exception as e:
         st.error(f"실행 중 오류가 발생했습니다: {e}")
